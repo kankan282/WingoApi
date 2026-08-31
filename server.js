@@ -1,11 +1,11 @@
-// server.js - Complete Wingo API Server
+// server.js
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const path = require('path');
 const { Server } = require('socket.io');
 const { insertResult, getLatest, getStats, getCount } = require('./database');
-const { getColor, getBigSmall, getOddEven, generatePeriod } = require('./utils');
+const { getColor, getBigSmall, getOddEven, generatePeriod, predictNext } = require('./utils');
 
 const app = express();
 const server = http.createServer(app);
@@ -30,17 +30,26 @@ async function newResult(gameType, num = null, period = null) {
             oddEven: getOddEven(number),
             gameType
         };
+
         const isNew = await insertResult(data);
         if (isNew) {
-            console.log(`[${gameType}] #${data.period.slice(-6)} → ${number} (${data.color})`);
-            io.to(gameType).emit('new_result', data);
+            console.log(`[${gameType}] Added: ${number} (${data.color})`);
+            
+            // Calculate next prediction for live stream
+            const history = await getLatest(gameType, 20);
+            const prediction = predictNext(history);
+
+            io.to(gameType).emit('new_result', {
+                result: data,
+                prediction: prediction
+            });
         }
     } catch (e) {
         console.error(`Error ${gameType}:`, e.message);
     }
 }
 
-// ========== SEED 120 RECORDS ON START ==========
+// ========== SEED INITIAL DATA ==========
 async function seedAll() {
     for (const g of GAMES) {
         const count = await getCount(g);
@@ -59,7 +68,6 @@ async function seedAll() {
                     gameType: g
                 });
             }
-            console.log(`✅ ${g} seeded!`);
         }
     }
 }
@@ -68,32 +76,62 @@ async function seedAll() {
 function startTimers() {
     GAMES.forEach(g => {
         setInterval(() => newResult(g), TIMERS[g] * 1000);
-        console.log(`⏱️  Timer started: ${g} (every ${TIMERS[g]}s)`);
+        console.log(`⏱️  Timer running: ${g} (every ${TIMERS[g]}s)`);
     });
 }
 
 // ========== API ROUTES ==========
 
-// Home → Frontend
+// Home -> Dashboard
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Get Results: /api/results?gameType=1min&limit=100
+// 📌 MAIN API: Results + Next Prediction
+// URL: /api/results?gameType=1min&limit=100
 app.get('/api/results', async (req, res) => {
     try {
         const g = req.query.gameType || '1min';
         const limit = Math.min(parseInt(req.query.limit) || 100, 500);
-        if (!GAMES.includes(g))
-            return res.status(400).json({ success: false, error: `Use: ${GAMES.join(', ')}` });
-        const data = await getLatest(g, limit);
-        res.json({ success: true, gameType: g, total: data.length, data });
+
+        if (!GAMES.includes(g)) {
+            return res.status(400).json({ success: false, error: `Invalid gameType. Use: ${GAMES.join(', ')}` });
+        }
+
+        const results = await getLatest(g, limit);
+        const prediction = predictNext(results);
+
+        res.json({
+            success: true,
+            gameType: g,
+            totalReturned: results.length,
+            nextPrediction: prediction,
+            results: results // Full 100+ items array here
+        });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
 });
 
-// Get Stats: /api/stats?gameType=1min&limit=100
+// 📌 PREDICTION ONLY API
+// URL: /api/prediction?gameType=1min
+app.get('/api/prediction', async (req, res) => {
+    try {
+        const g = req.query.gameType || '1min';
+        const history = await getLatest(g, 20);
+        const prediction = predictNext(history);
+
+        res.json({
+            success: true,
+            gameType: g,
+            prediction
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 📌 STATS API
 app.get('/api/stats', async (req, res) => {
     try {
         const g = req.query.gameType || '1min';
@@ -105,38 +143,39 @@ app.get('/api/stats', async (req, res) => {
     }
 });
 
-// Add Result Manually: POST /api/add
+// 📌 ADD RESULT MANUAL (POST)
 app.post('/api/add', async (req, res) => {
     try {
         const { gameType, period, number } = req.body;
-        if (!gameType || number === undefined)
-            return res.status(400).json({ success: false, error: 'Need gameType & number' });
+        if (!gameType || number === undefined) {
+            return res.status(400).json({ success: false, error: 'Missing gameType or number' });
+        }
         await newResult(gameType, parseInt(number), period);
-        res.json({ success: true });
+        res.json({ success: true, message: 'Result added successfully' });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
     }
 });
 
-// Health Check
+// Health check
 app.get('/health', (req, res) => {
-    res.json({ status: 'running', uptime: Math.floor(process.uptime()) + 's', games: GAMES });
+    res.json({ status: 'running', uptime: Math.floor(process.uptime()) + 's' });
 });
 
 // ========== SOCKET.IO ==========
 io.on('connection', (socket) => {
-    console.log('⚡ Connected:', socket.id);
     socket.on('join', async (gameType) => {
         socket.join(gameType);
         const history = await getLatest(gameType, 100);
-        socket.emit('history', history);
+        const prediction = predictNext(history);
+        socket.emit('initial_data', { history, prediction });
     });
 });
 
 // ========== START SERVER ==========
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', async () => {
-    console.log(`\n🚀 WINGO API LIVE → http://localhost:${PORT}\n`);
+    console.log(`\n🚀 WINGO API LIVE -> http://localhost:${PORT}`);
     await seedAll();
     startTimers();
 });
